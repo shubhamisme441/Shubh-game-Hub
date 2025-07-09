@@ -1,0 +1,86 @@
+import { Server } from "socket.io";
+import type { Server as HttpServer } from "http";
+import { storage } from "./storage";
+
+export function setupWebSocket(httpServer: HttpServer) {
+  const io = new Server(httpServer, {
+    cors: {
+      origin: "*",
+      methods: ["GET", "POST"]
+    }
+  });
+
+  io.on("connection", (socket) => {
+    console.log("User connected:", socket.id);
+
+    // Join group room
+    socket.on("join-group", (groupId: number) => {
+      socket.join(`group-${groupId}`);
+      console.log(`User ${socket.id} joined group ${groupId}`);
+    });
+
+    // Leave group room
+    socket.on("leave-group", (groupId: number) => {
+      socket.leave(`group-${groupId}`);
+      console.log(`User ${socket.id} left group ${groupId}`);
+    });
+
+    // Handle chat messages
+    socket.on("send-message", async (data: { groupId: number, message: string, userId: string }) => {
+      try {
+        const chatMessage = await storage.sendChatMessage({
+          groupId: data.groupId,
+          userId: data.userId,
+          message: data.message,
+        });
+
+        const user = await storage.getUser(data.userId);
+        
+        io.to(`group-${data.groupId}`).emit("new-message", {
+          ...chatMessage,
+          user,
+        });
+      } catch (error) {
+        console.error("Error sending chat message:", error);
+      }
+    });
+
+    // Handle game moves
+    socket.on("game-move", async (data: { gameId: number, move: any, userId: string }) => {
+      try {
+        const game = await storage.getGame(data.gameId);
+        if (!game) return;
+
+        const participants = await storage.getGameParticipants(data.gameId);
+        
+        // Broadcast move to all players in the group
+        io.to(`group-${game.groupId}`).emit("game-update", {
+          gameId: data.gameId,
+          move: data.move,
+          userId: data.userId,
+        });
+      } catch (error) {
+        console.error("Error handling game move:", error);
+      }
+    });
+
+    // Handle game state updates
+    socket.on("game-state-update", (data: { groupId: number, gameState: any }) => {
+      io.to(`group-${data.groupId}`).emit("game-state-changed", data.gameState);
+    });
+
+    // Handle player status updates
+    socket.on("player-status-update", (data: { groupId: number, userId: string, status: string }) => {
+      io.to(`group-${data.groupId}`).emit("player-status-changed", {
+        userId: data.userId,
+        status: data.status,
+      });
+    });
+
+    socket.on("disconnect", () => {
+      console.log("User disconnected:", socket.id);
+    });
+  });
+
+  return io;
+}
