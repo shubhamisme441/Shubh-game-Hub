@@ -1,0 +1,271 @@
+import {
+  users,
+  groups,
+  groupMembers,
+  games,
+  gameParticipants,
+  chatMessages,
+  playerStats,
+  type User,
+  type UpsertUser,
+  type Group,
+  type InsertGroup,
+  type Game,
+  type InsertGame,
+  type GameParticipant,
+  type InsertGameParticipant,
+  type ChatMessage,
+  type InsertChatMessage,
+  type GroupMember,
+  type PlayerStats,
+} from "@shared/schema";
+import { db } from "./db";
+import { eq, and, desc, sql } from "drizzle-orm";
+
+export interface IStorage {
+  // User operations (required for Replit Auth)
+  getUser(id: string): Promise<User | undefined>;
+  upsertUser(user: UpsertUser): Promise<User>;
+  
+  // Group operations
+  createGroup(group: InsertGroup): Promise<Group>;
+  getGroup(id: number): Promise<Group | undefined>;
+  getGroupByInviteCode(inviteCode: string): Promise<Group | undefined>;
+  getUserGroups(userId: string): Promise<Group[]>;
+  joinGroup(groupId: number, userId: string): Promise<void>;
+  leaveGroup(groupId: number, userId: string): Promise<void>;
+  getGroupMembers(groupId: number): Promise<(GroupMember & { user: User })[]>;
+  
+  // Game operations
+  createGame(game: InsertGame): Promise<Game>;
+  getGame(id: number): Promise<Game | undefined>;
+  updateGame(id: number, updates: Partial<Game>): Promise<Game>;
+  addGameParticipant(participant: InsertGameParticipant): Promise<GameParticipant>;
+  getGameParticipants(gameId: number): Promise<(GameParticipant & { user: User })[]>;
+  getActiveGroupGame(groupId: number): Promise<Game | undefined>;
+  
+  // Chat operations
+  getChatMessages(groupId: number, limit?: number): Promise<(ChatMessage & { user: User })[]>;
+  sendChatMessage(message: InsertChatMessage): Promise<ChatMessage>;
+  
+  // Stats operations
+  getPlayerStats(userId: string, groupId: number): Promise<PlayerStats[]>;
+  updatePlayerStats(userId: string, groupId: number, gameType: string, isWin: boolean, isDraw: boolean): Promise<void>;
+  getGroupLeaderboard(groupId: number): Promise<(User & { totalWins: number })[]>;
+}
+
+export class DatabaseStorage implements IStorage {
+  // User operations
+  async getUser(id: string): Promise<User | undefined> {
+    const [user] = await db.select().from(users).where(eq(users.id, id));
+    return user;
+  }
+
+  async upsertUser(userData: UpsertUser): Promise<User> {
+    const [user] = await db
+      .insert(users)
+      .values(userData)
+      .onConflictDoUpdate({
+        target: users.id,
+        set: {
+          ...userData,
+          updatedAt: new Date(),
+        },
+      })
+      .returning();
+    return user;
+  }
+
+  // Group operations
+  async createGroup(groupData: InsertGroup): Promise<Group> {
+    const [group] = await db.insert(groups).values(groupData).returning();
+    
+    // Add creator as member
+    await db.insert(groupMembers).values({
+      groupId: group.id,
+      userId: groupData.createdBy,
+    });
+    
+    return group;
+  }
+
+  async getGroup(id: number): Promise<Group | undefined> {
+    const [group] = await db.select().from(groups).where(eq(groups.id, id));
+    return group;
+  }
+
+  async getGroupByInviteCode(inviteCode: string): Promise<Group | undefined> {
+    const [group] = await db.select().from(groups).where(eq(groups.inviteCode, inviteCode));
+    return group;
+  }
+
+  async getUserGroups(userId: string): Promise<Group[]> {
+    const userGroups = await db
+      .select({ group: groups })
+      .from(groupMembers)
+      .innerJoin(groups, eq(groupMembers.groupId, groups.id))
+      .where(eq(groupMembers.userId, userId));
+    
+    return userGroups.map(row => row.group);
+  }
+
+  async joinGroup(groupId: number, userId: string): Promise<void> {
+    await db.insert(groupMembers).values({
+      groupId,
+      userId,
+    });
+  }
+
+  async leaveGroup(groupId: number, userId: string): Promise<void> {
+    await db.delete(groupMembers)
+      .where(and(eq(groupMembers.groupId, groupId), eq(groupMembers.userId, userId)));
+  }
+
+  async getGroupMembers(groupId: number): Promise<(GroupMember & { user: User })[]> {
+    const members = await db
+      .select({
+        groupMember: groupMembers,
+        user: users,
+      })
+      .from(groupMembers)
+      .innerJoin(users, eq(groupMembers.userId, users.id))
+      .where(eq(groupMembers.groupId, groupId));
+    
+    return members.map(row => ({ ...row.groupMember, user: row.user }));
+  }
+
+  // Game operations
+  async createGame(gameData: InsertGame): Promise<Game> {
+    const [game] = await db.insert(games).values(gameData).returning();
+    return game;
+  }
+
+  async getGame(id: number): Promise<Game | undefined> {
+    const [game] = await db.select().from(games).where(eq(games.id, id));
+    return game;
+  }
+
+  async updateGame(id: number, updates: Partial<Game>): Promise<Game> {
+    const [game] = await db
+      .update(games)
+      .set({ ...updates, updatedAt: new Date() })
+      .where(eq(games.id, id))
+      .returning();
+    return game;
+  }
+
+  async addGameParticipant(participantData: InsertGameParticipant): Promise<GameParticipant> {
+    const [participant] = await db.insert(gameParticipants).values(participantData).returning();
+    return participant;
+  }
+
+  async getGameParticipants(gameId: number): Promise<(GameParticipant & { user: User })[]> {
+    const participants = await db
+      .select({
+        participant: gameParticipants,
+        user: users,
+      })
+      .from(gameParticipants)
+      .innerJoin(users, eq(gameParticipants.userId, users.id))
+      .where(eq(gameParticipants.gameId, gameId));
+    
+    return participants.map(row => ({ ...row.participant, user: row.user }));
+  }
+
+  async getActiveGroupGame(groupId: number): Promise<Game | undefined> {
+    const [game] = await db
+      .select()
+      .from(games)
+      .where(and(eq(games.groupId, groupId), eq(games.status, "active")))
+      .orderBy(desc(games.createdAt))
+      .limit(1);
+    return game;
+  }
+
+  // Chat operations
+  async getChatMessages(groupId: number, limit = 50): Promise<(ChatMessage & { user: User })[]> {
+    const messages = await db
+      .select({
+        message: chatMessages,
+        user: users,
+      })
+      .from(chatMessages)
+      .innerJoin(users, eq(chatMessages.userId, users.id))
+      .where(eq(chatMessages.groupId, groupId))
+      .orderBy(desc(chatMessages.createdAt))
+      .limit(limit);
+    
+    return messages.map(row => ({ ...row.message, user: row.user })).reverse();
+  }
+
+  async sendChatMessage(messageData: InsertChatMessage): Promise<ChatMessage> {
+    const [message] = await db.insert(chatMessages).values(messageData).returning();
+    return message;
+  }
+
+  // Stats operations
+  async getPlayerStats(userId: string, groupId: number): Promise<PlayerStats[]> {
+    return await db
+      .select()
+      .from(playerStats)
+      .where(and(eq(playerStats.userId, userId), eq(playerStats.groupId, groupId)));
+  }
+
+  async updatePlayerStats(userId: string, groupId: number, gameType: string, isWin: boolean, isDraw: boolean): Promise<void> {
+    const existingStats = await db
+      .select()
+      .from(playerStats)
+      .where(and(
+        eq(playerStats.userId, userId),
+        eq(playerStats.groupId, groupId),
+        eq(playerStats.gameType, gameType)
+      ));
+
+    if (existingStats.length > 0) {
+      await db
+        .update(playerStats)
+        .set({
+          wins: sql`${playerStats.wins} + ${isWin ? 1 : 0}`,
+          losses: sql`${playerStats.losses} + ${!isWin && !isDraw ? 1 : 0}`,
+          draws: sql`${playerStats.draws} + ${isDraw ? 1 : 0}`,
+          totalGames: sql`${playerStats.totalGames} + 1`,
+        })
+        .where(and(
+          eq(playerStats.userId, userId),
+          eq(playerStats.groupId, groupId),
+          eq(playerStats.gameType, gameType)
+        ));
+    } else {
+      await db.insert(playerStats).values({
+        userId,
+        groupId,
+        gameType,
+        wins: isWin ? 1 : 0,
+        losses: !isWin && !isDraw ? 1 : 0,
+        draws: isDraw ? 1 : 0,
+        totalGames: 1,
+      });
+    }
+  }
+
+  async getGroupLeaderboard(groupId: number): Promise<(User & { totalWins: number })[]> {
+    const leaderboard = await db
+      .select({
+        user: users,
+        totalWins: sql<number>`COALESCE(SUM(${playerStats.wins}), 0)`,
+      })
+      .from(groupMembers)
+      .innerJoin(users, eq(groupMembers.userId, users.id))
+      .leftJoin(playerStats, and(
+        eq(playerStats.userId, users.id),
+        eq(playerStats.groupId, groupId)
+      ))
+      .where(eq(groupMembers.groupId, groupId))
+      .groupBy(users.id)
+      .orderBy(desc(sql`COALESCE(SUM(${playerStats.wins}), 0)`));
+    
+    return leaderboard.map(row => ({ ...row.user, totalWins: row.totalWins }));
+  }
+}
+
+export const storage = new DatabaseStorage();
